@@ -1,0 +1,27 @@
+# Example oink pipeline (stage 1): echo operations + terragrunt dry-run.
+# Running against the fixture repo: see README.
+pipeline:
+  - use: discovery                 # builtin: full UnitGraph via `terragrunt find --dag --json`
+  - use: affected                  # builtin: narrows the graph to changed dirs + dependents
+  - use: exec                      # test exec operation
+    name: hello
+    with: { run: 'echo "run {{ .Run.RunID }}: {{ .UnitsCount }} units affected"' }
+    on_failure: continue
+
+  - use: units                     # builtin: DAG scheduler
+    with:
+      parallelism: 8
+      order: dag                   # none | dag
+      pipeline:                    # per-unit
+        - use: exec
+          name: unit-hello
+          with: { run: 'echo "processing {{ .Unit.Path }}"' }
+        - use: terragrunt          # command comes from the CLI (oink run -- <command>)
+          with: { dry_run: true }
+        - use: exec
+          name: after
+          with: { run: 'echo "done {{ .Unit.Path }}, exit={{ .Prev.ExitCode }}"' }
+          on_failure: continue
+
+finally:
+  - use: report

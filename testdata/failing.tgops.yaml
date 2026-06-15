@@ -1,0 +1,18 @@
+# E2E failure scenario: pre fails for the db unit → app and worker are SKIPPED.
+pipeline:
+  - use: discovery
+  - use: units
+    with:
+      parallelism: 4
+      order: dag
+      pipeline:
+        - use: exec
+          name: pre
+          with: { run: '[ "{{ .Unit.Path }}" != "db" ]' }
+        - use: exec
+          name: work
+          with: { run: 'echo "processing {{ .Unit.Path }}"' }
+    on_failure: continue
+
+finally:
+  - use: report
