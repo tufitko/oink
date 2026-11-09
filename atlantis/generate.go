@@ -136,6 +136,12 @@ func Generate(ctx context.Context, opts Options) (*Config, error) {
 	for _, u := range units {
 		byPath[u.Path] = u
 	}
+	extraDeps := make(map[string][]string, len(resolved))
+	for _, ru := range resolved {
+		if ru.unit != nil && len(ru.locals.ExtraDeps) > 0 {
+			extraDeps[ru.unit.Path] = ru.locals.ExtraDeps
+		}
+	}
 
 	cfg := &Config{
 		Version:       3,
@@ -156,7 +162,7 @@ func Generate(ctx context.Context, opts Options) (*Config, error) {
 		if !emitted[ru.unit.Path] {
 			continue
 		}
-		cfg.Projects = append(cfg.Projects, buildProject(ru, byPath, repoRoot, opts))
+		cfg.Projects = append(cfg.Projects, buildProject(ru, byPath, extraDeps, repoRoot, opts))
 	}
 
 	sort.Slice(cfg.Projects, func(i, j int) bool { return cfg.Projects[i].Dir < cfg.Projects[j].Dir })
@@ -242,14 +248,14 @@ func includeUnit(ru resolvedUnit, opts Options) bool {
 	return true
 }
 
-func buildProject(ru resolvedUnit, byPath map[string]*engine.Unit, repoRoot string, opts Options) Project {
+func buildProject(ru resolvedUnit, byPath map[string]*engine.Unit, extraDeps map[string][]string, repoRoot string, opts Options) Project {
 	u := ru.unit
 
 	p := Project{
 		Dir: filepath.ToSlash(u.Path),
 		Autoplan: Autoplan{
 			Enabled:      resolveAutoplan(ru, opts),
-			WhenModified: whenModified(u, byPath, repoRoot, ru.locals.ExtraDeps, opts),
+			WhenModified: whenModified(u, byPath, extraDeps, repoRoot, opts),
 		},
 	}
 
@@ -302,10 +308,12 @@ func resolveApplyRequirements(ru resolvedUnit, opts Options) *[]string {
 	return &reqs
 }
 
-// whenModified builds the autoplan trigger list for a unit: its own files,
-// then (transitively, if cascade) its dependencies' configs and source files.
+// whenModified builds the autoplan trigger list for a unit: its own files and
+// extra_atlantis_dependencies, then (transitively, if cascade) its
+// dependencies' configs, source files and extra_atlantis_dependencies.
+// extraDeps maps a unit path to its extra_atlantis_dependencies.
 // Paths are relative to the unit directory, Unix-style, deduplicated.
-func whenModified(u *engine.Unit, byPath map[string]*engine.Unit, repoRoot string, extraDeps []string, opts Options) []string {
+func whenModified(u *engine.Unit, byPath map[string]*engine.Unit, extraDeps map[string][]string, repoRoot string, opts Options) []string {
 	seen := map[string]bool{}
 	out := []string{}
 	add := func(p string) {
@@ -328,18 +336,23 @@ func whenModified(u *engine.Unit, byPath map[string]*engine.Unit, repoRoot strin
 	add("*.hcl")
 	add("*.tf*")
 
-	// extra_atlantis_dependencies locals: made relative to the unit dir.
-	// They evaluate to absolute paths when built from get_terragrunt_dir().
+	// extra_atlantis_dependencies locals of a unit (the project itself or one
+	// of its dependencies), made relative to the project dir. They evaluate
+	// to absolute paths when built from get_terragrunt_dir(); a relative
+	// entry is relative to the declaring unit's directory.
 	absUnitDir := filepath.Join(repoRoot, u.Path)
-	for _, d := range extraDeps {
-		if filepath.IsAbs(d) {
+	addExtraDeps := func(owner string) {
+		absOwnerDir := filepath.Join(repoRoot, owner)
+		for _, d := range extraDeps[owner] {
+			if !filepath.IsAbs(d) {
+				d = filepath.Join(absOwnerDir, d)
+			}
 			if r, err := filepath.Rel(absUnitDir, d); err == nil {
 				add(filepath.ToSlash(r))
 			}
-			continue
 		}
-		add(filepath.ToSlash(filepath.Clean(d)))
 	}
+	addExtraDeps(u.Path)
 
 	// addSource turns a source file into a when_modified entry, matching
 	// terragrunt-atlantis-config: terraform files collapse to a `<dir>/*.tf*`
@@ -374,6 +387,7 @@ func whenModified(u *engine.Unit, byPath map[string]*engine.Unit, repoRoot strin
 		}
 		if d.Path != u.Path {
 			add(rel(filepath.Join(d.Path, "terragrunt.hcl")))
+			addExtraDeps(d.Path)
 		}
 		for _, sf := range d.SourceFiles {
 			addSource(sf)

@@ -293,3 +293,79 @@ func TestMarshalShape(t *testing.T) {
 		}
 	}
 }
+
+// A dependency's extra_atlantis_dependencies must cascade to its dependents
+// (as terragrunt-atlantis-config does): a change to the lambda sources has to
+// re-plan every distribution that references the lambda.
+func TestGenerateCascadesExtraDependencies(t *testing.T) {
+	if _, err := exec.LookPath("terragrunt"); err != nil {
+		t.Skip("terragrunt not in PATH")
+	}
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTree(t, root, map[string]string{
+		"modules/m/main.tf":   `resource "null_resource" "x" {}`,
+		"src/lambda/index.js": "",
+		"lambda/terragrunt.hcl": `
+terraform { source = "../modules/m" }
+locals {
+  src_path = "${get_terragrunt_dir()}/../src/lambda"
+  extra_atlantis_dependencies = ["${local.src_path}/package.json", "${local.src_path}/src/*"]
+}
+`,
+		"dist/x/terragrunt.hcl": `
+terraform { source = "../../modules/m" }
+dependency "lambda" { config_path = "../../lambda" }
+`,
+		"records/x/terragrunt.hcl": `
+terraform { source = "../../modules/m" }
+dependency "dist" { config_path = "../../dist/x" }
+`,
+	})
+	if out, err := exec.Command("git", "init", "-q", root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+
+	cfg, err := Generate(context.Background(), baseOpts(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lambda := projectByDir(cfg, "lambda").Autoplan.WhenModified
+	for _, want := range []string{"../src/lambda/package.json", "../src/lambda/src/*"} {
+		if !slices.Contains(lambda, want) {
+			t.Errorf("lambda when_modified missing own extra dep %q: %v", want, lambda)
+		}
+	}
+
+	dist := projectByDir(cfg, "dist/x").Autoplan.WhenModified
+	for _, want := range []string{"../../src/lambda/package.json", "../../src/lambda/src/*"} {
+		if !slices.Contains(dist, want) {
+			t.Errorf("dist/x when_modified missing cascaded extra dep %q: %v", want, dist)
+		}
+	}
+
+	// Transitive: records/x -> dist/x -> lambda.
+	records := projectByDir(cfg, "records/x").Autoplan.WhenModified
+	if !slices.Contains(records, "../../src/lambda/src/*") {
+		t.Errorf("records/x when_modified missing transitive extra dep: %v", records)
+	}
+
+	// Without cascade only direct dependencies' extra deps are picked up.
+	opts := baseOpts(root)
+	opts.CascadeDependencies = false
+	cfg, err = Generate(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records = projectByDir(cfg, "records/x").Autoplan.WhenModified
+	if slices.Contains(records, "../../src/lambda/src/*") {
+		t.Errorf("records/x must not cascade extra deps with cascade=false: %v", records)
+	}
+	dist = projectByDir(cfg, "dist/x").Autoplan.WhenModified
+	if !slices.Contains(dist, "../../src/lambda/src/*") {
+		t.Errorf("dist/x must still see its direct dependency's extra deps with cascade=false: %v", dist)
+	}
+}
